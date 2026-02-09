@@ -157,13 +157,17 @@ ensure_nodejs_runtime() {
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
 
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    local codename="${VERSION_CODENAME:-jammy}"
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x ${codename} main" \
+    # NodeSource now supports a distro-agnostic channel. Prefer nodistro first.
+    rm -f /etc/apt/sources.list.d/nodesource.list
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
         >/etc/apt/sources.list.d/nodesource.list
 
-    apt-get update -y
+    if ! apt-get update -y; then
+        warn "NodeSource nodistro repo update failed. Falling back to setup script..."
+        rm -f /etc/apt/sources.list.d/nodesource.list
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    fi
+
     apt-get install -y nodejs
 
     node_major="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)"
@@ -177,6 +181,9 @@ ensure_nodejs_runtime() {
 
 install_dependencies() {
     info "Checking system dependencies..."
+
+    # Remove stale/broken NodeSource entries from previous failed runs.
+    rm -f /etc/apt/sources.list.d/nodesource.list
 
     ensure_php_repo
 
