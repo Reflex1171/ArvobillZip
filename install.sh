@@ -138,6 +138,43 @@ ensure_php_repo() {
     add-apt-repository -y ppa:ondrej/php
 }
 
+ensure_nodejs_runtime() {
+    local node_major="0"
+    if command -v node >/dev/null 2>&1; then
+        node_major="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)"
+    fi
+
+    if [[ "$node_major" -ge 18 ]]; then
+        success "Node.js runtime is compatible (v$(node -v))."
+        return
+    fi
+
+    warn "Node.js 18+ is required. Installing Node.js 20.x from NodeSource..."
+    apt-get update -y
+    apt-get install -y ca-certificates curl gnupg
+
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    local codename="${VERSION_CODENAME:-jammy}"
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x ${codename} main" \
+        >/etc/apt/sources.list.d/nodesource.list
+
+    apt-get update -y
+    apt-get install -y nodejs
+
+    node_major="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)"
+    if [[ "$node_major" -lt 18 ]]; then
+        error "Node.js upgrade failed. Detected version: $(node -v 2>/dev/null || echo unknown)"
+        exit 1
+    fi
+
+    success "Node.js installed: $(node -v), npm: $(npm -v)"
+}
+
 install_dependencies() {
     info "Checking system dependencies..."
 
@@ -149,8 +186,6 @@ install_dependencies() {
         curl
         composer
         mariadb-server
-        nodejs
-        npm
         php8.2
         php8.2-cli
         php8.2-fpm
@@ -184,6 +219,7 @@ install_dependencies() {
 
     if [[ "${#missing[@]}" -eq 0 ]]; then
         success "All required packages are already installed."
+        ensure_nodejs_runtime
         return
     fi
 
@@ -191,26 +227,45 @@ install_dependencies() {
     apt-get update -y
     apt-get install -y "${missing[@]}"
     success "System dependencies installed."
+
+    ensure_nodejs_runtime
+}
+
+start_database_service() {
+    local service_name="$1"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files | grep -q "^${service_name}\.service"; then
+            systemctl enable "$service_name" >/dev/null 2>&1 || true
+            systemctl restart "$service_name" >/dev/null 2>&1 || true
+            if systemctl is-active --quiet "$service_name"; then
+                return 0
+            fi
+        fi
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        if service "$service_name" start >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 ensure_database_service() {
-    if systemctl list-unit-files | grep -q '^mariadb\.service'; then
-        info "Ensuring MariaDB service is enabled and running..."
-        systemctl enable mariadb >/dev/null 2>&1 || true
-        systemctl restart mariadb
-        success "MariaDB is running."
-        return
-    fi
+    local candidates=(mariadb mysql mysqld)
+    local candidate
 
-    if systemctl list-unit-files | grep -q '^mysql\.service'; then
-        info "Ensuring MySQL service is enabled and running..."
-        systemctl enable mysql >/dev/null 2>&1 || true
-        systemctl restart mysql
-        success "MySQL is running."
-        return
-    fi
+    for candidate in "${candidates[@]}"; do
+        info "Checking database service: ${candidate}"
+        if start_database_service "$candidate"; then
+            success "Database service is running via '${candidate}'."
+            return
+        fi
+    done
 
-    error "No MariaDB/MySQL service found after dependency installation."
+    error "No MariaDB/MySQL service could be started. Check package install logs and run: systemctl status mariadb"
     exit 1
 }
 
