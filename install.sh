@@ -144,6 +144,8 @@ install_dependencies() {
         unzip
         curl
         composer
+        mariadb-server
+        default-mysql-client
         nodejs
         npm
         php8.2
@@ -155,6 +157,7 @@ install_dependencies() {
         php8.2-bcmath
         php8.2-zip
         php8.2-mysql
+        php8.2-intl
     )
 
     local missing=()
@@ -174,6 +177,27 @@ install_dependencies() {
     apt-get update -y
     apt-get install -y "${missing[@]}"
     success "System dependencies installed."
+}
+
+ensure_database_service() {
+    if systemctl list-unit-files | grep -q '^mariadb\.service'; then
+        info "Ensuring MariaDB service is enabled and running..."
+        systemctl enable mariadb >/dev/null 2>&1 || true
+        systemctl restart mariadb
+        success "MariaDB is running."
+        return
+    fi
+
+    if systemctl list-unit-files | grep -q '^mysql\.service'; then
+        info "Ensuring MySQL service is enabled and running..."
+        systemctl enable mysql >/dev/null 2>&1 || true
+        systemctl restart mysql
+        success "MySQL is running."
+        return
+    fi
+
+    error "No MariaDB/MySQL service found after dependency installation."
+    exit 1
 }
 
 setup_nginx_and_ssl() {
@@ -296,23 +320,90 @@ update_env_value() {
     fi
 }
 
+run_mysql_query() {
+    local query="$1"
+    local root_password="${2:-}"
+
+    if [[ -n "$root_password" ]]; then
+        MYSQL_PWD="$root_password" mysql -u root -e "$query"
+    else
+        mysql -u root -e "$query"
+    fi
+}
+
+escape_sql_string() {
+    local input="$1"
+    printf "%s" "${input//\'/\'\'}"
+}
+
+create_mysql_database_and_user() {
+    local db_host="$1"
+    local db_name="$2"
+    local db_user="$3"
+    local db_password="$4"
+    local db_port="$5"
+
+    info "Creating MySQL database and user..."
+
+    local root_password=""
+    if ! mysql -u root -e "SELECT 1;" >/dev/null 2>&1; then
+        warn "Direct MySQL root login failed. Root password may be required."
+        read -r -s -p "MySQL root password: " root_password
+        echo
+    fi
+
+    local user_host="$db_host"
+    if [[ -z "$user_host" || "$user_host" == "localhost" || "$user_host" == "127.0.0.1" ]]; then
+        user_host="127.0.0.1"
+    fi
+
+    local db_name_escaped db_user_escaped db_password_escaped user_host_escaped
+    db_name_escaped="$(escape_sql_string "$db_name")"
+    db_user_escaped="$(escape_sql_string "$db_user")"
+    db_password_escaped="$(escape_sql_string "$db_password")"
+    user_host_escaped="$(escape_sql_string "$user_host")"
+
+    run_mysql_query "CREATE DATABASE IF NOT EXISTS \`$db_name_escaped\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" "$root_password"
+    run_mysql_query "CREATE USER IF NOT EXISTS '$db_user_escaped'@'$user_host_escaped' IDENTIFIED BY '$db_password_escaped';" "$root_password"
+    run_mysql_query "GRANT ALL PRIVILEGES ON \`$db_name_escaped\`.* TO '$db_user_escaped'@'$user_host_escaped';" "$root_password"
+
+    if [[ "$user_host" == "127.0.0.1" ]]; then
+        run_mysql_query "CREATE USER IF NOT EXISTS '$db_user_escaped'@'localhost' IDENTIFIED BY '$db_password_escaped';" "$root_password"
+        run_mysql_query "GRANT ALL PRIVILEGES ON \`$db_name_escaped\`.* TO '$db_user_escaped'@'localhost';" "$root_password"
+    fi
+
+    run_mysql_query "FLUSH PRIVILEGES;" "$root_password"
+    success "MySQL database/user ready: ${db_name} / ${db_user}@${user_host}"
+}
+
 prompt_database_config() {
     info "Database configuration"
 
     read -r -p "Database host [127.0.0.1]: " db_host
+    read -r -p "Database port [3306]: " db_port
     read -r -p "Database name: " db_name
     read -r -p "Database user: " db_user
     read -r -s -p "Database password: " db_password
     echo
 
-    if [[ -z "${db_name}" || -z "${db_user}" ]]; then
-        error "Database name and user are required."
+    if [[ -z "${db_name}" || -z "${db_user}" || -z "${db_password}" ]]; then
+        error "Database name, user, and password are required."
         exit 1
     fi
 
+    local resolved_host="${db_host:-127.0.0.1}"
+    local resolved_port="${db_port:-3306}"
+
+    read -r -p "Auto-create MySQL database and user now? [Y/n]: " create_db_user
+    if [[ ! "$create_db_user" =~ ^[Nn]$ ]]; then
+        create_mysql_database_and_user "$resolved_host" "$db_name" "$db_user" "$db_password" "$resolved_port"
+    else
+        warn "Skipping automatic DB user/database creation."
+    fi
+
     update_env_value "DB_CONNECTION" "mysql"
-    update_env_value "DB_HOST" "${db_host:-127.0.0.1}"
-    update_env_value "DB_PORT" "3306"
+    update_env_value "DB_HOST" "$resolved_host"
+    update_env_value "DB_PORT" "$resolved_port"
     update_env_value "DB_DATABASE" "$db_name"
     update_env_value "DB_USERNAME" "$db_user"
     update_env_value "DB_PASSWORD" "$db_password"
@@ -353,6 +444,7 @@ main() {
     prompt_install_dir
     download_and_extract
     install_dependencies
+    ensure_database_service
     setup_application_dependencies
     setup_laravel
     prompt_database_config
