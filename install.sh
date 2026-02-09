@@ -123,6 +123,10 @@ package_installed() {
     dpkg -s "$1" >/dev/null 2>&1
 }
 
+package_available() {
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
 ensure_php_repo() {
     if apt-cache show php8.2-cli >/dev/null 2>&1; then
         return
@@ -145,7 +149,6 @@ install_dependencies() {
         curl
         composer
         mariadb-server
-        default-mysql-client
         nodejs
         npm
         php8.2
@@ -159,6 +162,17 @@ install_dependencies() {
         php8.2-mysql
         php8.2-intl
     )
+
+    # MySQL client package names vary by distro/repo; prefer MariaDB client.
+    if package_available "mariadb-client"; then
+        packages+=("mariadb-client")
+    elif package_available "default-mysql-client"; then
+        packages+=("default-mysql-client")
+    elif package_available "mysql-client"; then
+        packages+=("mysql-client")
+    else
+        warn "No MySQL/MariaDB client package found in APT. Continuing with server package only."
+    fi
 
     local missing=()
     local pkg
