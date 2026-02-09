@@ -421,8 +421,19 @@ setup_laravel() {
     php "$INSTALL_DIR/artisan" key:generate --force
     success "Application key generated."
 
-    chmod -R ug+rwx "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache"
-    success "Permissions updated for storage and bootstrap/cache."
+    local web_user="www-data"
+    local web_group="www-data"
+
+    if id -u "$web_user" >/dev/null 2>&1; then
+        chown -R "$web_user:$web_group" "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache"
+        find "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache" -type d -exec chmod 775 {} \;
+        find "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache" -type f -exec chmod 664 {} \;
+        success "Permissions and ownership updated for storage and bootstrap/cache."
+    else
+        warn "User '$web_user' not found. Applying permission-only fallback."
+        chmod -R ug+rwx "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache"
+        success "Permissions updated for storage and bootstrap/cache."
+    fi
 }
 
 update_env_value() {
