@@ -127,6 +127,23 @@ package_available() {
     apt-cache show "$1" >/dev/null 2>&1
 }
 
+cleanup_nodesource_sources() {
+    # Remove stale NodeSource entries that can break apt update.
+    if [[ -f /etc/apt/sources.list ]]; then
+        sed -i '/deb\.nodesource\.com/d' /etc/apt/sources.list || true
+    fi
+
+    if [[ -d /etc/apt/sources.list.d ]]; then
+        local list_file
+        for list_file in /etc/apt/sources.list.d/*.list; do
+            [[ -e "$list_file" ]] || continue
+            sed -i '/deb\.nodesource\.com/d' "$list_file" || true
+        done
+
+        rm -f /etc/apt/sources.list.d/nodesource.list
+    fi
+}
+
 ensure_php_repo() {
     if apt-cache show php8.2-cli >/dev/null 2>&1; then
         return
@@ -139,6 +156,26 @@ ensure_php_repo() {
 }
 
 ensure_nodejs_runtime() {
+    local nvm_dir="/root/.nvm"
+
+    load_nvm() {
+        # shellcheck disable=SC1090
+        [[ -s "${nvm_dir}/nvm.sh" ]] && source "${nvm_dir}/nvm.sh"
+    }
+
+    expose_nvm_binaries() {
+        local node_bin
+        node_bin="$(command -v node || true)"
+        if [[ -n "$node_bin" ]]; then
+            ln -sf "$node_bin" /usr/local/bin/node || true
+            local npm_bin npx_bin
+            npm_bin="$(command -v npm || true)"
+            npx_bin="$(command -v npx || true)"
+            [[ -n "$npm_bin" ]] && ln -sf "$npm_bin" /usr/local/bin/npm || true
+            [[ -n "$npx_bin" ]] && ln -sf "$npx_bin" /usr/local/bin/npx || true
+        fi
+    }
+
     local node_major="0"
     if command -v node >/dev/null 2>&1; then
         node_major="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)"
@@ -149,27 +186,25 @@ ensure_nodejs_runtime() {
         return
     fi
 
-    warn "Node.js 18+ is required. Installing Node.js 20.x from NodeSource..."
+    warn "Node.js 18+ is required. Installing Node.js 20 via nvm..."
     apt-get update -y
-    apt-get install -y ca-certificates curl gnupg
+    apt-get install -y ca-certificates curl
 
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-
-    # NodeSource now supports a distro-agnostic channel. Prefer nodistro first.
-    rm -f /etc/apt/sources.list.d/nodesource.list
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
-        >/etc/apt/sources.list.d/nodesource.list
-
-    if ! apt-get update -y; then
-        warn "NodeSource nodistro repo update failed. Falling back to setup script..."
-        rm -f /etc/apt/sources.list.d/nodesource.list
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    if [[ ! -s "${nvm_dir}/nvm.sh" ]]; then
+        curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
     fi
 
-    apt-get install -y nodejs
+    load_nvm
+    if ! command -v nvm >/dev/null 2>&1; then
+        error "nvm installation failed."
+        exit 1
+    fi
 
+    nvm install 20
+    nvm alias default 20
+    nvm use 20 >/dev/null
+
+    expose_nvm_binaries
     node_major="$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)"
     if [[ "$node_major" -lt 18 ]]; then
         error "Node.js upgrade failed. Detected version: $(node -v 2>/dev/null || echo unknown)"
@@ -183,7 +218,7 @@ install_dependencies() {
     info "Checking system dependencies..."
 
     # Remove stale/broken NodeSource entries from previous failed runs.
-    rm -f /etc/apt/sources.list.d/nodesource.list
+    cleanup_nodesource_sources
 
     ensure_php_repo
 
@@ -354,6 +389,12 @@ EOF
 }
 
 setup_application_dependencies() {
+    if [[ -s /root/.nvm/nvm.sh ]]; then
+        # shellcheck disable=SC1091
+        source /root/.nvm/nvm.sh
+        nvm use 20 >/dev/null 2>&1 || true
+    fi
+
     info "Installing PHP dependencies..."
     composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$INSTALL_DIR"
     success "Composer dependencies installed."
