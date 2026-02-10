@@ -205,6 +205,19 @@ run_post_update_steps() {
     fi
 }
 
+ensure_schedule_cron() {
+    local cron_line="* * * * * cd ${INSTALL_DIR} && php artisan schedule:run >> /dev/null 2>&1"
+
+    if crontab -l 2>/dev/null | grep -Fq "$cron_line"; then
+        success "Cron job already exists for scheduler."
+        return
+    fi
+
+    info "Adding scheduler cron job..."
+    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
+    success "Scheduler cron job installed."
+}
+
 finish() {
     if [[ "${APP_WAS_PUT_DOWN}" == "yes" ]]; then
         php "${INSTALL_DIR}/artisan" up || true
@@ -236,8 +249,8 @@ main() {
     install_dependencies_and_build
     fix_permissions
     run_post_update_steps
+    ensure_schedule_cron
     finish
 }
 
 main "$@"
-
