@@ -8,6 +8,8 @@ TMP_DIR="$(mktemp -d /tmp/arvobill.XXXXXX)"
 DEFAULT_INSTALL_DIR="/var/www/arvobill"
 SSL_CONFIGURED="no"
 PANEL_DOMAIN=""
+COMPOSER_ALLOW_SUPERUSER=1
+COMPOSER_CAFILE_PATH="/etc/ssl/certs/ca-certificates.crt"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -29,6 +31,43 @@ warn() {
 
 error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+ensure_composer_tls() {
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        if [[ -f "/etc/ssl/cert.pem" ]]; then
+            COMPOSER_CAFILE_PATH="/etc/ssl/cert.pem"
+        fi
+    fi
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        info "Installing CA certificates..."
+        apt-get update -y
+        apt-get install -y ca-certificates openssl
+    fi
+
+    update-ca-certificates >/dev/null 2>&1 || true
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        if [[ -f "/etc/ssl/cert.pem" ]]; then
+            COMPOSER_CAFILE_PATH="/etc/ssl/cert.pem"
+        fi
+    fi
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        error "CA bundle not found at ${COMPOSER_CAFILE_PATH}."
+        exit 1
+    fi
+
+    if [[ ! -r "${COMPOSER_CAFILE_PATH}" ]]; then
+        error "CA bundle is not readable at ${COMPOSER_CAFILE_PATH}."
+        exit 1
+    fi
+
+    export COMPOSER_ALLOW_SUPERUSER=1
+    export COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}"
+    export SSL_CERT_FILE="${COMPOSER_CAFILE_PATH}"
+    export CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}"
 }
 
 cleanup() {
@@ -396,7 +435,10 @@ setup_application_dependencies() {
     fi
 
     info "Installing PHP dependencies..."
-    composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$INSTALL_DIR"
+    ensure_composer_tls
+    COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}" \
+        SSL_CERT_FILE="${COMPOSER_CAFILE_PATH}" CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}" \
+        composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$INSTALL_DIR"
     success "Composer dependencies installed."
 
     info "Installing Node dependencies..."
@@ -434,6 +476,26 @@ setup_laravel() {
         chmod -R ug+rwx "$INSTALL_DIR/storage" "$INSTALL_DIR/bootstrap/cache"
         success "Permissions updated for storage and bootstrap/cache."
     fi
+}
+
+configure_cron() {
+    read -r -p "Install Laravel scheduler cron job? [Y/n]: " install_cron
+    if [[ "$install_cron" =~ ^[Nn]$ ]]; then
+        warn "Skipping cron setup."
+        return
+    fi
+
+    local cron_line="* * * * * cd ${INSTALL_DIR} && php artisan schedule:run >> /dev/null 2>&1"
+    local current_cron
+    current_cron="$(crontab -l 2>/dev/null || true)"
+
+    if echo "$current_cron" | grep -Fq "$cron_line"; then
+        success "Cron job already exists."
+        return
+    fi
+
+    (echo "$current_cron"; echo "$cron_line") | crontab -
+    success "Cron job installed: schedule:run every minute."
 }
 
 update_env_value() {
@@ -575,6 +637,7 @@ main() {
     ensure_database_service
     setup_application_dependencies
     setup_laravel
+    configure_cron
     prompt_database_config
     setup_nginx_and_ssl
     print_summary
