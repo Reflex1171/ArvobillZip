@@ -7,6 +7,8 @@ DEFAULT_INSTALL_DIR="/var/www/arvobill"
 TMP_ZIP="/tmp/arvobill-update.zip"
 TMP_DIR="$(mktemp -d /tmp/arvobill-update.XXXXXX)"
 APP_WAS_PUT_DOWN="no"
+COMPOSER_ALLOW_SUPERUSER=1
+COMPOSER_CAFILE_PATH="/etc/ssl/certs/ca-certificates.crt"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,6 +30,22 @@ warn() {
 
 error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+ensure_composer_tls() {
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        info "Installing CA certificates..."
+        apt-get update -y
+        apt-get install -y ca-certificates
+    fi
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        error "CA bundle not found at ${COMPOSER_CAFILE_PATH}."
+        exit 1
+    fi
+
+    export COMPOSER_ALLOW_SUPERUSER=1
+    export COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}"
 }
 
 cleanup() {
@@ -160,6 +178,7 @@ sync_files() {
 
 install_dependencies_and_build() {
     load_nvm_if_present
+    ensure_composer_tls
 
     info "Installing PHP dependencies..."
     composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$INSTALL_DIR"
