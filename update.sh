@@ -34,12 +34,24 @@ error() {
 
 ensure_composer_tls() {
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        if [[ -f "/etc/ssl/cert.pem" ]]; then
+            COMPOSER_CAFILE_PATH="/etc/ssl/cert.pem"
+        fi
+    fi
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
         info "Installing CA certificates..."
         apt-get update -y
-        apt-get install -y ca-certificates
+        apt-get install -y ca-certificates openssl
     fi
 
     update-ca-certificates >/dev/null 2>&1 || true
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        if [[ -f "/etc/ssl/cert.pem" ]]; then
+            COMPOSER_CAFILE_PATH="/etc/ssl/cert.pem"
+        fi
+    fi
 
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
         error "CA bundle not found at ${COMPOSER_CAFILE_PATH}."
@@ -170,7 +182,7 @@ sync_files() {
     info "Syncing application files..."
 
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete \
+        rsync -a --delete --force --delete-after \
             --exclude ".env" \
             --exclude "storage/*" \
             --exclude "bootstrap/cache/*" \
@@ -190,7 +202,9 @@ install_dependencies_and_build() {
     ensure_composer_tls
 
     info "Installing PHP dependencies..."
-    composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$INSTALL_DIR"
+    COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}" \
+        SSL_CERT_FILE="${COMPOSER_CAFILE_PATH}" CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}" \
+        composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$INSTALL_DIR"
     success "Composer install complete."
 
     info "Installing Node dependencies..."
