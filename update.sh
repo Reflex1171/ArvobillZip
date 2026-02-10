@@ -39,13 +39,22 @@ ensure_composer_tls() {
         apt-get install -y ca-certificates
     fi
 
+    update-ca-certificates >/dev/null 2>&1 || true
+
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
         error "CA bundle not found at ${COMPOSER_CAFILE_PATH}."
         exit 1
     fi
 
+    if [[ ! -r "${COMPOSER_CAFILE_PATH}" ]]; then
+        error "CA bundle is not readable at ${COMPOSER_CAFILE_PATH}."
+        exit 1
+    fi
+
     export COMPOSER_ALLOW_SUPERUSER=1
     export COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}"
+    export SSL_CERT_FILE="${COMPOSER_CAFILE_PATH}"
+    export CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}"
 }
 
 cleanup() {
