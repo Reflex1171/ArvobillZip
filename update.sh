@@ -45,6 +45,12 @@ ensure_composer_tls() {
         apt-get install -y ca-certificates openssl
     fi
 
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        info "Downloading CA bundle..."
+        curl -fsSL https://curl.se/ca/cacert.pem -o /usr/local/share/ca-certificates/arvobill-extra.crt || true
+        update-ca-certificates >/dev/null 2>&1 || true
+    fi
+
     update-ca-certificates >/dev/null 2>&1 || true
 
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
@@ -67,6 +73,10 @@ ensure_composer_tls() {
     export COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}"
     export SSL_CERT_FILE="${COMPOSER_CAFILE_PATH}"
     export CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}"
+
+    if command -v composer >/dev/null 2>&1; then
+        composer config --global cafile "${COMPOSER_CAFILE_PATH}" >/dev/null 2>&1 || true
+    fi
 }
 
 cleanup() {
@@ -260,6 +270,37 @@ ensure_schedule_cron() {
     success "Scheduler cron job installed."
 }
 
+ensure_queue_worker() {
+    if ! command -v supervisorctl >/dev/null 2>&1; then
+        info "Installing Supervisor..."
+        apt-get update -y
+        apt-get install -y supervisor
+    fi
+
+    local conf="/etc/supervisor/conf.d/arvobill-worker.conf"
+    if [[ -f "$conf" ]]; then
+        success "Supervisor worker config already exists."
+    else
+        cat >"$conf" <<EOF
+[program:arvobill-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php ${INSTALL_DIR}/artisan queue:work --sleep=3 --tries=3 --timeout=120
+autostart=true
+autorestart=true
+numprocs=1
+user=www-data
+redirect_stderr=true
+stdout_logfile=/var/log/arvobill-worker.log
+stopwaitsecs=3600
+EOF
+        success "Supervisor worker config created."
+    fi
+
+    supervisorctl reread || true
+    supervisorctl update || true
+    supervisorctl status || true
+}
+
 finish() {
     if [[ "${APP_WAS_PUT_DOWN}" == "yes" ]]; then
         php "${INSTALL_DIR}/artisan" up || true
@@ -292,6 +333,7 @@ main() {
     fix_permissions
     run_post_update_steps
     ensure_schedule_cron
+    ensure_queue_worker
     finish
 }
 
