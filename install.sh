@@ -509,6 +509,43 @@ configure_cron() {
     success "Cron job installed: schedule:run every minute."
 }
 
+setup_queue_worker() {
+    read -r -p "Install queue worker (Supervisor)? [Y/n]: " install_worker
+    if [[ "$install_worker" =~ ^[Nn]$ ]]; then
+        warn "Skipping queue worker setup."
+        return
+    fi
+
+    if ! command -v supervisorctl >/dev/null 2>&1; then
+        info "Installing Supervisor..."
+        apt-get update -y
+        apt-get install -y supervisor
+    fi
+
+    local conf="/etc/supervisor/conf.d/arvobill-worker.conf"
+    if [[ -f "$conf" ]]; then
+        success "Supervisor worker config already exists."
+    else
+        cat >"$conf" <<EOF
+[program:arvobill-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php ${INSTALL_DIR}/artisan queue:work --sleep=3 --tries=3 --timeout=120
+autostart=true
+autorestart=true
+numprocs=1
+user=www-data
+redirect_stderr=true
+stdout_logfile=/var/log/arvobill-worker.log
+stopwaitsecs=3600
+EOF
+        success "Supervisor worker config created."
+    fi
+
+    supervisorctl reread || true
+    supervisorctl update || true
+    supervisorctl status || true
+}
+
 update_env_value() {
     local key="$1"
     local value="$2"
@@ -649,6 +686,7 @@ main() {
     setup_application_dependencies
     setup_laravel
     configure_cron
+    setup_queue_worker
     prompt_database_config
     setup_nginx_and_ssl
     print_summary
