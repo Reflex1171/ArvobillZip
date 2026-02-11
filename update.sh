@@ -9,6 +9,7 @@ TMP_DIR="$(mktemp -d /tmp/arvobill-update.XXXXXX)"
 APP_WAS_PUT_DOWN="no"
 COMPOSER_ALLOW_SUPERUSER=1
 COMPOSER_CAFILE_PATH="/etc/ssl/certs/ca-certificates.crt"
+PHP_SERIES=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,18 +46,18 @@ ensure_composer_tls() {
         apt-get install -y ca-certificates openssl
     fi
 
-    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
-        info "Downloading CA bundle..."
-        curl -fsSL https://curl.se/ca/cacert.pem -o /usr/local/share/ca-certificates/arvobill-extra.crt || true
-        update-ca-certificates >/dev/null 2>&1 || true
-    fi
-
     update-ca-certificates >/dev/null 2>&1 || true
 
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
         if [[ -f "/etc/ssl/cert.pem" ]]; then
             COMPOSER_CAFILE_PATH="/etc/ssl/cert.pem"
         fi
+    fi
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        info "Downloading CA bundle fallback..."
+        curl -fsSL https://curl.se/ca/cacert.pem -o /tmp/arvobill-cacert.pem
+        COMPOSER_CAFILE_PATH="/tmp/arvobill-cacert.pem"
     fi
 
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
@@ -75,8 +76,54 @@ ensure_composer_tls() {
     export CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}"
 
     if command -v composer >/dev/null 2>&1; then
+        composer config --global --unset cafile >/dev/null 2>&1 || true
         composer config --global cafile "${COMPOSER_CAFILE_PATH}" >/dev/null 2>&1 || true
     fi
+}
+
+detect_php_series() {
+    if ! command -v php >/dev/null 2>&1; then
+        error "PHP is not installed or not in PATH."
+        exit 1
+    fi
+
+    PHP_SERIES="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+    if [[ -z "${PHP_SERIES}" ]]; then
+        error "Unable to detect PHP version."
+        exit 1
+    fi
+
+    success "Detected PHP ${PHP_SERIES}"
+}
+
+ensure_php_extensions() {
+    detect_php_series
+
+    local update_done="no"
+    install_pkg_if_missing() {
+        local pkg="$1"
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            return
+        fi
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            if [[ "$update_done" == "no" ]]; then
+                apt-get update -y
+                update_done="yes"
+            fi
+            apt-get install -y "$pkg"
+        fi
+    }
+
+    install_pkg_if_missing "php${PHP_SERIES}-mbstring"
+    install_pkg_if_missing "php${PHP_SERIES}-xml"
+    install_pkg_if_missing "php${PHP_SERIES}-curl"
+    install_pkg_if_missing "php${PHP_SERIES}-zip"
+    install_pkg_if_missing "php${PHP_SERIES}-mysql"
+
+    # Fallback package names on some repos.
+    install_pkg_if_missing "php-mbstring"
+    install_pkg_if_missing "php-xml"
+    install_pkg_if_missing "php-mysql"
 }
 
 cleanup() {
@@ -209,6 +256,7 @@ sync_files() {
 
 install_dependencies_and_build() {
     load_nvm_if_present
+    ensure_php_extensions
     ensure_composer_tls
 
     info "Installing PHP dependencies..."
@@ -278,13 +326,21 @@ ensure_queue_worker() {
     fi
 
     local conf="/etc/supervisor/conf.d/arvobill-worker.conf"
+    local desired_command="command=php ${INSTALL_DIR}/artisan queue:work --queue=emails,default --sleep=3 --tries=3 --timeout=120"
+
     if [[ -f "$conf" ]]; then
-        success "Supervisor worker config already exists."
+        if grep -Fq "$desired_command" "$conf"; then
+            success "Supervisor worker config already exists."
+        else
+            info "Updating existing Supervisor worker config..."
+            sed -i "s|^command=.*|${desired_command}|" "$conf"
+            success "Supervisor worker config updated."
+        fi
     else
         cat >"$conf" <<EOF
 [program:arvobill-worker]
 process_name=%(program_name)s_%(process_num)02d
-command=php ${INSTALL_DIR}/artisan queue:work --sleep=3 --tries=3 --timeout=120
+${desired_command}
 autostart=true
 autorestart=true
 numprocs=1
@@ -298,6 +354,7 @@ EOF
 
     supervisorctl reread || true
     supervisorctl update || true
+    supervisorctl restart arvobill-worker:* || true
     supervisorctl status || true
 }
 
@@ -314,7 +371,7 @@ finish() {
     echo
     echo "Recommended checks:"
     echo "1) php ${INSTALL_DIR}/artisan migrate --force   (if not run already)"
-    echo "2) systemctl status nginx php8.2-fpm"
+    echo "2) systemctl status nginx php-fpm"
     echo "3) Verify checkout, payments, and provisioning flows in panel UI"
 }
 
