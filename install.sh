@@ -10,6 +10,7 @@ SSL_CONFIGURED="no"
 PANEL_DOMAIN=""
 COMPOSER_ALLOW_SUPERUSER=1
 COMPOSER_CAFILE_PATH="/etc/ssl/certs/ca-certificates.crt"
+PHP_SERIES=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,18 +47,18 @@ ensure_composer_tls() {
         apt-get install -y ca-certificates openssl
     fi
 
-    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
-        info "Downloading CA bundle..."
-        curl -fsSL https://curl.se/ca/cacert.pem -o /usr/local/share/ca-certificates/arvobill-extra.crt || true
-        update-ca-certificates >/dev/null 2>&1 || true
-    fi
-
     update-ca-certificates >/dev/null 2>&1 || true
 
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
         if [[ -f "/etc/ssl/cert.pem" ]]; then
             COMPOSER_CAFILE_PATH="/etc/ssl/cert.pem"
         fi
+    fi
+
+    if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
+        info "Downloading CA bundle fallback..."
+        curl -fsSL https://curl.se/ca/cacert.pem -o /tmp/arvobill-cacert.pem
+        COMPOSER_CAFILE_PATH="/tmp/arvobill-cacert.pem"
     fi
 
     if [[ ! -f "${COMPOSER_CAFILE_PATH}" ]]; then
@@ -77,8 +78,25 @@ ensure_composer_tls() {
 
     # Ensure Composer respects the CA bundle even if a bad global config exists.
     if command -v composer >/dev/null 2>&1; then
+        composer config --global --unset cafile >/dev/null 2>&1 || true
         composer config --global cafile "${COMPOSER_CAFILE_PATH}" >/dev/null 2>&1 || true
     fi
+}
+
+detect_php_series() {
+    if ! command -v php >/dev/null 2>&1; then
+        PHP_SERIES="8.2"
+        warn "PHP is not installed yet. Defaulting installer target to PHP ${PHP_SERIES}."
+        return
+    fi
+
+    PHP_SERIES="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+    if [[ -z "${PHP_SERIES}" ]]; then
+        error "Unable to detect PHP version."
+        exit 1
+    fi
+
+    success "Detected PHP ${PHP_SERIES}"
 }
 
 cleanup() {
@@ -205,6 +223,34 @@ ensure_php_repo() {
     add-apt-repository -y ppa:ondrej/php
 }
 
+ensure_php_extensions() {
+    detect_php_series
+
+    local update_done="no"
+    install_pkg_if_missing() {
+        local pkg="$1"
+        if dpkg -s "$pkg" >/dev/null 2>&1; then
+            return
+        fi
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            if [[ "$update_done" == "no" ]]; then
+                apt-get update -y
+                update_done="yes"
+            fi
+            apt-get install -y "$pkg"
+        fi
+    }
+
+    install_pkg_if_missing "php${PHP_SERIES}-mbstring"
+    install_pkg_if_missing "php${PHP_SERIES}-xml"
+    install_pkg_if_missing "php${PHP_SERIES}-curl"
+    install_pkg_if_missing "php${PHP_SERIES}-zip"
+    install_pkg_if_missing "php${PHP_SERIES}-mysql"
+    install_pkg_if_missing "php-mbstring"
+    install_pkg_if_missing "php-xml"
+    install_pkg_if_missing "php-mysql"
+}
+
 ensure_nodejs_runtime() {
     local nvm_dir="/root/.nvm"
 
@@ -271,6 +317,7 @@ install_dependencies() {
     cleanup_nodesource_sources
 
     ensure_php_repo
+    detect_php_series
 
     local packages=(
         nginx
@@ -278,16 +325,16 @@ install_dependencies() {
         curl
         composer
         mariadb-server
-        php8.2
-        php8.2-cli
-        php8.2-fpm
-        php8.2-curl
-        php8.2-mbstring
-        php8.2-xml
-        php8.2-bcmath
-        php8.2-zip
-        php8.2-mysql
-        php8.2-intl
+        "php${PHP_SERIES}"
+        "php${PHP_SERIES}-cli"
+        "php${PHP_SERIES}-fpm"
+        "php${PHP_SERIES}-curl"
+        "php${PHP_SERIES}-mbstring"
+        "php${PHP_SERIES}-xml"
+        "php${PHP_SERIES}-bcmath"
+        "php${PHP_SERIES}-zip"
+        "php${PHP_SERIES}-mysql"
+        "php${PHP_SERIES}-intl"
     )
 
     # MySQL client package names vary by distro/repo; prefer MariaDB client.
@@ -321,6 +368,7 @@ install_dependencies() {
     success "System dependencies installed."
 
     ensure_nodejs_runtime
+    ensure_php_extensions
 }
 
 start_database_service() {
@@ -362,6 +410,8 @@ ensure_database_service() {
 }
 
 setup_nginx_and_ssl() {
+    detect_php_series
+
     read -r -p "Configure Nginx and Let's Encrypt SSL now? [Y/n]: " configure_ssl
     if [[ "$configure_ssl" =~ ^[Nn]$ ]]; then
         warn "Skipping automatic Nginx/SSL setup."
@@ -408,7 +458,7 @@ server {
 
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+        fastcgi_pass unix:/run/php/php${PHP_SERIES}-fpm.sock;
     }
 
     location ~ /\.ht {
@@ -446,6 +496,7 @@ setup_application_dependencies() {
     fi
 
     info "Installing PHP dependencies..."
+    ensure_php_extensions
     ensure_composer_tls
     COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_CAFILE="${COMPOSER_CAFILE_PATH}" \
         SSL_CERT_FILE="${COMPOSER_CAFILE_PATH}" CURL_CA_BUNDLE="${COMPOSER_CAFILE_PATH}" \
@@ -523,13 +574,21 @@ setup_queue_worker() {
     fi
 
     local conf="/etc/supervisor/conf.d/arvobill-worker.conf"
+    local desired_command="command=php ${INSTALL_DIR}/artisan queue:work --queue=emails,default --sleep=3 --tries=3 --timeout=120"
+
     if [[ -f "$conf" ]]; then
-        success "Supervisor worker config already exists."
+        if grep -Fq "$desired_command" "$conf"; then
+            success "Supervisor worker config already exists."
+        else
+            info "Updating existing Supervisor worker config..."
+            sed -i "s|^command=.*|${desired_command}|" "$conf"
+            success "Supervisor worker config updated."
+        fi
     else
         cat >"$conf" <<EOF
 [program:arvobill-worker]
 process_name=%(program_name)s_%(process_num)02d
-command=php ${INSTALL_DIR}/artisan queue:work --sleep=3 --tries=3 --timeout=120
+${desired_command}
 autostart=true
 autorestart=true
 numprocs=1
